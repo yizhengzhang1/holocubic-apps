@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "runtime": {
+    "version": "Lua 5.4"
+  },
+  "workspace": {
+    "library": [".luals"],
+    "ignoreDir": [
+      "**/build",
+      "**/__pycache__",
+      "**/tests",
+      "mp3_player/src/legacy"
+    ],
+    "checkThirdParty": false
+  },
+  "diagnostics": {
+    "globals": [],
+    "disable": [],
+    "severity": {
+      "undefined-field": "Information"
+    }
+  }
+}

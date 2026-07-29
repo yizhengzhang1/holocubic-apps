@@ -1,0 +1,46 @@
+# 文档（README_LVGL.md / README_LUA.md / README_HOST_ABI.md / README.md）没写、
+# 但人工确认过确实存在的固件全局。只有列在这里的名字才会被 gen_luals_meta.py 写进 meta。
+#
+# 加名字之前先确认它真的存在——拼错的名字一旦进来，LuaLS 就不再报 undefined-global，
+# 设备上会变成对 nil 的调用。判断依据按可信度排序：固件文档 > 跨多个 app 使用 > 代码里
+# 有 `if not X then` 之类的存在性探测 > 单点使用且无保护（这种应该留在外面继续报警）。
+
+# --- LVGL 标准枚举，文档只列了用到的一部分 ---
+LV_ALIGN_TOP_LEFT
+LV_ALIGN_TOP_MID
+LV_ALIGN_TOP_RIGHT
+LV_ALIGN_BOTTOM_LEFT
+LV_ALIGN_BOTTOM_MID
+LV_ALIGN_BOTTOM_RIGHT
+LV_TEXT_ALIGN_LEFT
+LV_TEXT_ALIGN_CENTER
+LV_TEXT_ALIGN_RIGHT
+LV_OBJ_FLAG_HIDDEN
+LV_OBJ_FLAG_CLICKABLE
+LV_OBJ_FLAG_SCROLLABLE
+LV_OBJ_FLAG_OVERFLOW_VISIBLE
+LV_LABEL_LONG_CLIP
+LV_GRAD_DIR_VER
+LV_FONT_MONTSERRAT_12
+
+# --- LVGL 标准 API ---
+lv_obj_update_layout
+lv_refr_now
+lv_timer_handler
+lv_task_handler        # LVGL v7 名字，BTC/package/ui.lua 里作为 lv_timer_handler 的回退
+
+# --- 固件模块，跨多个 app 使用 ---
+gamepad                # 27 处 / 2 app
+rtctime                # 27 处 / 4 app
+service_ui             # README_LUA.md 提到「后台浮层使用 service_ui」，但没列出接口；
+                       # xiaozhi-service/package/service_ui.lua:220 有 `if not service_ui or not service_ui.acquire` 探测
+
+# --- 固件自有的 LVGL 扩展，代码里带存在性探测 ---
+lv_begin               # 2048/package/main.lua:96 `if not lv_begin or not lv_end`
+lv_end
+lv_clear               # 19 处 / 6 app
+lv_img_free_handle     # 10 处 / 2 app
+
+# 故意不收：
+#   CANVAS_FMT_TRUE_COLOR —— Spectrum/package/ui.lua:134 无保护地当 canvas 格式参数用，
+#   而文档和测试桩里的格式常量叫 LV_IMG_CF_TRUE_COLOR。疑似写错，先让它继续报警。

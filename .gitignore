@@ -17,3 +17,7 @@ info页面要求.md
 /xiaozhi/src/**/config/
 /xiaozhi/src/**/.pio/
 /xiaozhi/src/**/sdkconfig.old
+
+# python 缓存
+__pycache__/
+*.pyc

@@ -778,6 +778,27 @@ end
 local FULL_DAY_NAMES = { SUN = "SUNDAY", MON = "MONDAY", TUE = "TUESDAY", WED = "WEDNESDAY", THU = "THURSDAY", FRI = "FRIDAY", SAT = "SATURDAY" }
 local FULL_MONTH_NAMES = { JAN = "JANUARY", FEB = "FEBRUARY", MAR = "MARCH", APR = "APRIL", MAY = "MAY", JUN = "JUNE", JUL = "JULY", AUG = "AUGUST", SEP = "SEPTEMBER", OCT = "OCTOBER", NOV = "NOVEMBER", DEC = "DECEMBER" }
 
+-- Advance widths measured from the bundled time_num_69 font on the device.
+-- Keeping these per digit makes the colon follow every hour value instead of
+-- being tuned for only a wide pair such as "09" or a narrow pair such as "10".
+local NEON_DIGIT_ADVANCE = {
+  [0] = 44, [1] = 26, [2] = 40, [3] = 42, [4] = 44,
+  [5] = 41, [6] = 42, [7] = 37, [8] = 42, [9] = 42,
+}
+local NEON_LETTER_SPACE = -7
+local NEON_HOUR_X = 18
+local NEON_HOUR_TO_COLON = 9
+local NEON_COLON_TO_MINUTE = 18
+
+local function neon_pair_width(value)
+  local pair = tostring(value or "00")
+  local first = tonumber(pair:sub(1, 1)) or 0
+  local second = tonumber(pair:sub(2, 2)) or 0
+  return (NEON_DIGIT_ADVANCE[first] or 42)
+      + (NEON_DIGIT_ADVANCE[second] or 42)
+      + NEON_LETTER_SPACE
+end
+
 local function draw_neon_girl(t)
   fill(C.black)
   local src = "S:/apps/NixieClock/assets/neon-girl-bg.png"
@@ -785,10 +806,15 @@ local function draw_neon_girl(t)
   local day, month, date = date_parts(t)
   local date_label = (FULL_DAY_NAMES[day] or day) .. ", " .. (FULL_MONTH_NAMES[month] or month) .. " " .. date
   text(20, 31, 190, date_label, APP.font.en9, 0xA8D8EE, nil, nil, 4)
-  text(18, 68, 84, format("%02d", t.hour), APP.font.n69, C.white, nil, nil, -7)
+  local hh = format("%02d", t.hour)
+  local mm = format("%02d", t.min)
+  local colon_x = NEON_HOUR_X + neon_pair_width(hh) + NEON_HOUR_TO_COLON
+  local minute_x = colon_x + NEON_COLON_TO_MINUTE
+  -- max_w is also LVGL's wrapping width, so use the remaining screen width.
+  text(NEON_HOUR_X, 68, APP.SCREEN_W - NEON_HOUR_X, hh, APP.font.n69, C.white, nil, nil, NEON_LETTER_SPACE)
   local colon_color = floor((t.sec or 0) / 2) % 2 == 0 and C.white or 0x181C20
-  text(93, 60, 24, ":", APP.font.n69, colon_color)
-  text(117, 68, 90, format("%02d", t.min), APP.font.n69, C.white, nil, nil, -7)
+  text(colon_x, 60, 24, ":", APP.font.n69, colon_color)
+  text(minute_x, 68, APP.SCREEN_W - minute_x, mm, APP.font.n69, C.white, nil, nil, NEON_LETTER_SPACE)
   text(19, 142, 40, temp_text(), APP.font.en20, C.white, nil, nil, -1)
   line(60, 144, 60, 163, 0x56CBE2, 255, 1)
   text(71, 148, 76, ascii_city_label(APP.state.city) .. " " .. string.char(194, 183), APP.font.en12, 0x8EB9CA, nil, nil, 1)

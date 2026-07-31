@@ -4,17 +4,20 @@ if previous and previous.stop then
 end
 
 HOLO_TIME_APP = {
-  VERSION = "2026-07-16-holo-nixie-v6",
+  VERSION = "2026-07-31-holo-nixie-v7",
   SCREEN_W = 320,
   SCREEN_H = 240,
   APP_DIR = "/sd/apps/NixieClock",
   SETTINGS_PATH = "/sd/apps/settings.json",
   CONFIG_PATH = "/sd/apps/NixieClock/config.json",
+  WEATHER_CACHE_PATH = "/sd/apps/NixieClock/weather-cache.json",
   DEFAULT_TIMEZONE = "CST-8",
   NTP_SERVER = "ntp.aliyun.com",
   WEATHER_NOW_PATH = "/v1/weather/now",
   WEATHER_3D_PATH = "/v1/weather/3d",
   WEATHER_CITY_PATH = "/v1/weather/cities",
+  OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast",
+  OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search",
   WEATHER_FETCH_MS = 30 * 60 * 1000,
   MEMO_FETCH_MS = 30 * 1000,
   MEMO_PATHS = {
@@ -116,10 +119,16 @@ APP.state = {
   humidity = nil,
   wind_speed = nil,
   weather_code = "103",
+  weather_source = "",
+  weather_last_error = "",
   weather_inflight = false,
   forecast_valid = false,
   forecast_inflight = false,
   forecast_days = {},
+  open_meteo_latitude = nil,
+  open_meteo_longitude = nil,
+  open_meteo_inflight = false,
+  open_meteo_last_ms = -60000,
   memos = { "请先安装 Assistant app", "", "" },
   memo_available = false,
   memo_source = "",
@@ -166,6 +175,15 @@ local function decode_json(raw)
   if codec and codec.decode then
     local ok, value = pcall_fn(codec.decode, raw)
     if ok and type(value) == "table" then return value end
+  end
+  return nil
+end
+
+local function encode_json_value(value)
+  local codec = rawget(_G, "json") or rawget(_G, "sjson")
+  if codec and codec.encode then
+    local ok, raw = pcall_fn(codec.encode, value)
+    if ok and type(raw) == "string" then return raw end
   end
   return nil
 end
@@ -288,11 +306,85 @@ local function load_settings()
   if state.timezone == "" then state.timezone = APP.DEFAULT_TIMEZONE end
   state.weather_address = trim(doc.weather_address or doc.weatherAddress)
   state.weather_location_id = trim(doc.weather_location_id)
+  state.open_meteo_latitude = tonumber(doc.weather_latitude or doc.weather_lat)
+  state.open_meteo_longitude = tonumber(doc.weather_longitude or doc.weather_lon)
   local city = state.weather_address ~= "" and state.weather_address or trim(doc.weather_city or doc.city_name or doc.city)
   if city ~= "" then
     state.city = safe_city_label(city)
     state.location_label = ascii_city_label(city)
   end
+end
+
+local function weather_location_key()
+  local state = APP.state
+  local address = trim(state.weather_address):lower()
+  local location = trim(state.weather_location_id)
+  if address == "" then address = trim(state.city):lower() end
+  if address ~= "" then return "address=" .. address end
+  return "id=" .. location
+end
+
+local function load_weather_cache()
+  local doc = decode_json(read_text(APP.WEATHER_CACHE_PATH))
+  if type(doc) ~= "table" or tonumber(doc.schema) ~= 1 then return false end
+  if tostring(doc.location_key or "") ~= weather_location_key() then return false end
+
+  local state = APP.state
+  state.open_meteo_latitude = tonumber(doc.latitude) or state.open_meteo_latitude
+  state.open_meteo_longitude = tonumber(doc.longitude) or state.open_meteo_longitude
+
+  local weather = type(doc.weather) == "table" and doc.weather or nil
+  if weather and tonumber(weather.temp) ~= nil then
+    state.temp = tonumber(weather.temp)
+    state.humidity = tonumber(weather.humidity)
+    state.wind_speed = tonumber(weather.wind_speed)
+    state.weather_code = tostring(weather.code or "103")
+    state.weather_text = tostring(weather.text or "--")
+    state.weather_valid = true
+    state.weather_source = "cache:" .. tostring(doc.source or "unknown")
+  end
+
+  local days = {}
+  if type(doc.forecast_days) == "table" then
+    for i = 1, 3 do
+      local item = doc.forecast_days[i]
+      if type(item) == "table" then
+        days[#days + 1] = {
+          date = tostring(item.date or ""),
+          icon = tostring(item.icon or "103"),
+          text = tostring(item.text or "--"),
+          temp_max = tonumber(item.temp_max),
+          temp_min = tonumber(item.temp_min),
+        }
+      end
+    end
+  end
+  if #days > 0 then
+    state.forecast_days = days
+    state.forecast_valid = true
+  end
+  return state.weather_valid or state.forecast_valid
+end
+
+local function save_weather_cache(source)
+  local state = APP.state
+  if not state.weather_valid and not state.forecast_valid then return false end
+  local raw = encode_json_value({
+    schema = 1,
+    location_key = weather_location_key(),
+    source = tostring(source or state.weather_source or "unknown"),
+    latitude = state.open_meteo_latitude,
+    longitude = state.open_meteo_longitude,
+    weather = state.weather_valid and {
+      temp = state.temp,
+      humidity = state.humidity,
+      wind_speed = state.wind_speed,
+      code = state.weather_code,
+      text = state.weather_text,
+    } or nil,
+    forecast_days = state.forecast_valid and state.forecast_days or nil,
+  })
+  return type(raw) == "string" and write_text(APP.WEATHER_CACHE_PATH, raw)
 end
 
 local function load_app_config()
@@ -1196,28 +1288,67 @@ local function maybe_gunzip(body)
   return body
 end
 
+local WMO_CONDITIONS = {
+  [0] = { "100", "晴" },
+  [1] = { "101", "晴间多云" },
+  [2] = { "103", "多云" },
+  [3] = { "104", "阴" },
+  [45] = { "501", "雾" },
+  [48] = { "509", "冻雾" },
+  [51] = { "309", "小毛毛雨" },
+  [53] = { "305", "毛毛雨" },
+  [55] = { "306", "强毛毛雨" },
+  [56] = { "313", "冻毛毛雨" },
+  [57] = { "313", "强冻毛毛雨" },
+  [61] = { "305", "小雨" },
+  [63] = { "306", "中雨" },
+  [65] = { "307", "大雨" },
+  [66] = { "313", "冻雨" },
+  [67] = { "313", "强冻雨" },
+  [71] = { "400", "小雪" },
+  [73] = { "401", "中雪" },
+  [75] = { "402", "大雪" },
+  [77] = { "499", "米雪" },
+  [80] = { "300", "阵雨" },
+  [81] = { "301", "强阵雨" },
+  [82] = { "310", "暴雨" },
+  [85] = { "407", "阵雪" },
+  [86] = { "408", "强阵雪" },
+  [95] = { "302", "雷阵雨" },
+  [96] = { "304", "雷阵雨伴有冰雹" },
+  [99] = { "304", "强雷阵雨伴有冰雹" },
+}
+
+local function wmo_condition(code)
+  local normalized = floor(tonumber(code) or -1)
+  local condition = WMO_CONDITIONS[normalized] or { "103", "多云" }
+  return condition[1], condition[2]
+end
+
 local function parse_weather(status, body)
-  if status ~= 200 or not body then return false end
+  if tonumber(status) ~= 200 or not body then return false end
   local doc = decode_json(maybe_gunzip(body))
   if not doc or tostring(doc.code or "") ~= "200" or type(doc.now) ~= "table" then return false end
   local current = doc.now
-  APP.state.temp = tonumber(current.temp)
+  local temperature = tonumber(current.temp)
+  if temperature == nil then return false end
+  APP.state.temp = temperature
   APP.state.humidity = tonumber(current.humidity)
   APP.state.wind_speed = tonumber(current.windSpeed)
   APP.state.weather_code = tostring(current.icon or "103")
   APP.state.weather_text = tostring(current.text or "--")
-  APP.state.weather_valid = APP.state.temp ~= nil
+  APP.state.weather_valid = true
+  APP.state.weather_source = "cubicserver"
+  APP.state.weather_last_error = ""
+  save_weather_cache("cubicserver")
   render()
-  return APP.state.weather_valid
+  return true
 end
 
 local function parse_forecast(status, body)
-  if status ~= 200 or not body then APP.state.forecast_valid = false; return false end
+  if tonumber(status) ~= 200 or not body then return false end
   local doc = decode_json(maybe_gunzip(body))
-  if not doc or tostring(doc.code or "") ~= "200" or type(doc.daily) ~= "table" then
-    APP.state.forecast_valid = false
-    return false
-  end
+  if not doc or tostring(doc.code or "") ~= "200" or type(doc.daily) ~= "table" then return false end
   local days = {}
   for i = 1, 3 do
     local item = doc.daily[i]
@@ -1231,73 +1362,246 @@ local function parse_forecast(status, body)
       }
     end
   end
+  if #days == 0 then return false end
   APP.state.forecast_days = days
-  APP.state.forecast_valid = #days > 0
+  APP.state.forecast_valid = true
+  save_weather_cache("cubicserver")
   render()
-  return APP.state.forecast_valid
+  return true
+end
+
+local function parse_open_meteo(status, body)
+  if tonumber(status) ~= 200 or type(body) ~= "string" then return false end
+  local doc = decode_json(maybe_gunzip(body))
+  local current = doc and doc.current
+  local temperature = type(current) == "table" and tonumber(current.temperature_2m) or nil
+  if temperature == nil then return false end
+
+  local icon, text_label = wmo_condition(current.weather_code)
+  APP.state.temp = temperature
+  APP.state.humidity = tonumber(current.relative_humidity_2m)
+  APP.state.wind_speed = tonumber(current.wind_speed_10m)
+  APP.state.weather_code = icon
+  APP.state.weather_text = text_label
+  APP.state.weather_valid = true
+
+  local daily = type(doc.daily) == "table" and doc.daily or {}
+  local dates = type(daily.time) == "table" and daily.time or {}
+  local codes = type(daily.weather_code) == "table" and daily.weather_code or {}
+  local maximums = type(daily.temperature_2m_max) == "table" and daily.temperature_2m_max or {}
+  local minimums = type(daily.temperature_2m_min) == "table" and daily.temperature_2m_min or {}
+  local days = {}
+  for i = 1, 3 do
+    if dates[i] ~= nil then
+      local day_icon, day_text = wmo_condition(codes[i])
+      days[#days + 1] = {
+        date = tostring(dates[i] or ""),
+        icon = day_icon,
+        text = day_text,
+        temp_max = tonumber(maximums[i]),
+        temp_min = tonumber(minimums[i]),
+      }
+    end
+  end
+  if #days > 0 then
+    APP.state.forecast_days = days
+    APP.state.forecast_valid = true
+  end
+
+  APP.state.weather_source = "open-meteo"
+  APP.state.weather_last_error = ""
+  APP.state.open_meteo_last_ms = now_ms()
+  save_weather_cache("open-meteo")
+  render()
+  return true
+end
+
+local function open_meteo_url(latitude, longitude)
+  return APP.OPEN_METEO_FORECAST_URL
+      .. "?latitude=" .. url_encode(format("%.5f", latitude))
+      .. "&longitude=" .. url_encode(format("%.5f", longitude))
+      .. "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+      .. "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+      .. "&timezone=Asia%2FShanghai&forecast_days=3"
+end
+
+local function fallback_location_query()
+  local query = trim(APP.state.weather_address)
+  if query == "" or query:match("^%d+$") then query = trim(APP.state.city) end
+  return query
+end
+
+local request_open_meteo
+
+local function finish_open_meteo(success, message)
+  APP.state.open_meteo_inflight = false
+  APP.state.weather_inflight = false
+  APP.state.forecast_inflight = false
+  if not success then APP.state.weather_last_error = tostring(message or "Open-Meteo request failed") end
+end
+
+local function fetch_open_meteo_forecast(http_mod)
+  local latitude = tonumber(APP.state.open_meteo_latitude)
+  local longitude = tonumber(APP.state.open_meteo_longitude)
+  if not latitude or not longitude then
+    finish_open_meteo(false, "Open-Meteo coordinates unavailable")
+    return
+  end
+  local ok, err = pcall_fn(function()
+    http_mod.get(open_meteo_url(latitude, longitude), {}, function(status, body)
+      if not APP.running then return end
+      local parsed = parse_open_meteo(status, body)
+      finish_open_meteo(parsed, parsed and nil or body)
+    end)
+  end)
+  if not ok then finish_open_meteo(false, err) end
+end
+
+request_open_meteo = function(reason)
+  if not APP.running then return false end
+  if APP.state.open_meteo_inflight then return true end
+  local http_mod = rawget(_G, "http")
+  if not http_mod or not http_mod.get then
+    finish_open_meteo(false, "http.get unavailable")
+    return false
+  end
+
+  APP.state.open_meteo_inflight = true
+  APP.state.weather_inflight = true
+  APP.state.forecast_inflight = true
+  APP.state.weather_last_error = tostring(reason or "")
+
+  if tonumber(APP.state.open_meteo_latitude) and tonumber(APP.state.open_meteo_longitude) then
+    fetch_open_meteo_forecast(http_mod)
+    return true
+  end
+
+  local query = fallback_location_query()
+  if query == "" then
+    finish_open_meteo(false, "weather location unavailable")
+    return false
+  end
+  local geocoding_url = APP.OPEN_METEO_GEOCODING_URL
+      .. "?name=" .. url_encode(query)
+      .. "&count=1&language=zh&format=json"
+  local ok, err = pcall_fn(function()
+    http_mod.get(geocoding_url, {}, function(status, body)
+      if not APP.running then return end
+      local doc = tonumber(status) == 200 and decode_json(maybe_gunzip(body)) or nil
+      local first = doc and type(doc.results) == "table" and doc.results[1] or nil
+      local latitude = type(first) == "table" and tonumber(first.latitude) or nil
+      local longitude = type(first) == "table" and tonumber(first.longitude) or nil
+      if not latitude or not longitude then
+        finish_open_meteo(false, body)
+        return
+      end
+      APP.state.open_meteo_latitude = latitude
+      APP.state.open_meteo_longitude = longitude
+      fetch_open_meteo_forecast(http_mod)
+    end)
+  end)
+  if not ok then finish_open_meteo(false, err) end
+  return ok
 end
 
 local function request_forecast_for(location)
   local http_mod = rawget(_G, "http")
   if not http_mod or not http_mod.cubicserver or not http_mod.cubicserver.get then
-    APP.state.forecast_inflight = false
+    request_open_meteo("cubicserver unavailable")
     return
   end
   APP.state.forecast_inflight = true
   local url = APP.WEATHER_3D_PATH .. "?location=" .. url_encode(location) .. "&unit=m&lang=zh"
-  http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
-    APP.state.forecast_inflight = false
-    if APP.running then parse_forecast(status, body) end
+  local ok, err = pcall_fn(function()
+    http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
+      if not APP.running then return end
+      if parse_forecast(status, body) then
+        APP.state.forecast_inflight = false
+      else
+        request_open_meteo(type(body) == "string" and body or "cubicserver forecast failed")
+      end
+    end)
   end)
+  if not ok then request_open_meteo(err) end
 end
 
 local function request_weather_for(location)
   local http_mod = rawget(_G, "http")
   if not http_mod or not http_mod.cubicserver or not http_mod.cubicserver.get then
-    APP.state.weather_inflight = false
+    request_open_meteo("cubicserver unavailable")
     return
   end
+  APP.state.weather_inflight = true
   local url = APP.WEATHER_NOW_PATH .. "?location=" .. url_encode(location) .. "&unit=m&lang=zh"
-  http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
-    APP.state.weather_inflight = false
-    if APP.running then parse_weather(status, body) end
+  local ok, err = pcall_fn(function()
+    http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
+      if not APP.running then return end
+      if parse_weather(status, body) then
+        APP.state.weather_inflight = false
+      else
+        request_open_meteo(type(body) == "string" and body or "cubicserver weather failed")
+      end
+    end)
   end)
+  if not ok then request_open_meteo(err) end
 end
 
 local function request_weather()
   if not APP.running or APP.state.weather_inflight then return end
-  local http_mod = rawget(_G, "http")
-  if not http_mod or not http_mod.cubicserver or not http_mod.cubicserver.get then return end
   local raw_location = APP.state.weather_address
   local location = APP.state.weather_location_id
   if location == "" and raw_location:match("^%d+$") then location = raw_location end
   if location ~= "" then
-    APP.state.weather_inflight = true
     request_weather_for(location)
     return
   end
   if raw_location == "" then return end
+
+  local http_mod = rawget(_G, "http")
+  if not http_mod or not http_mod.cubicserver or not http_mod.cubicserver.get then
+    request_open_meteo("cubicserver unavailable")
+    return
+  end
   APP.state.weather_inflight = true
   local url = APP.WEATHER_CITY_PATH .. "?location=" .. url_encode(raw_location) .. "&number=1&lang=zh"
-  http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
-    if not APP.running then return end
-    local doc = status == 200 and decode_json(maybe_gunzip(body)) or nil
-    local locations = doc and (doc.locations or doc.location)
-    local first = type(locations) == "table" and locations[1] or nil
-    local id = type(first) == "table" and trim(first.id) or ""
-    if APP.state.weather_address == "" and type(first) == "table" and trim(first.name) ~= "" then APP.state.city = safe_city_label(first.name) end
-    if id == "" then APP.state.weather_inflight = false; return end
-    APP.state.weather_location_id = id
-    request_weather_for(id)
-    if not APP.state.forecast_inflight then request_forecast_for(id) end
+  local ok, err = pcall_fn(function()
+    http_mod.cubicserver.get(url, "Accept-Encoding: gzip\r\n", function(status, body)
+      if not APP.running then return end
+      local doc = tonumber(status) == 200 and decode_json(maybe_gunzip(body)) or nil
+      local locations = doc and (doc.locations or doc.location)
+      local first = type(locations) == "table" and locations[1] or nil
+      local id = type(first) == "table" and trim(first.id) or ""
+      if type(first) == "table" then
+        APP.state.open_meteo_latitude = tonumber(first.lat) or APP.state.open_meteo_latitude
+        APP.state.open_meteo_longitude = tonumber(first.lon) or APP.state.open_meteo_longitude
+        if APP.state.weather_address == "" and trim(first.name) ~= "" then APP.state.city = safe_city_label(first.name) end
+      end
+      if id == "" then
+        request_open_meteo(type(body) == "string" and body or "cubicserver geocoding failed")
+        return
+      end
+      APP.state.weather_location_id = id
+      request_weather_for(id)
+      if not APP.state.forecast_inflight then request_forecast_for(id) end
+    end)
   end)
+  if not ok then request_open_meteo(err) end
 end
 
 local function request_forecast()
-  if not APP.running or APP.state.forecast_inflight then return end
+  if not APP.running or APP.state.forecast_inflight or APP.state.open_meteo_inflight then return end
+  if APP.state.weather_source == "open-meteo"
+      and APP.state.forecast_valid
+      and now_ms() - APP.state.open_meteo_last_ms < 60000 then
+    return
+  end
   local location = APP.state.weather_location_id
   if location == "" and APP.state.weather_address:match("^%d+$") then location = APP.state.weather_address end
-  if location ~= "" then request_forecast_for(location) end
+  if location ~= "" then
+    request_forecast_for(location)
+  elseif APP.state.weather_address ~= "" then
+    request_open_meteo("cubicserver location unavailable")
+  end
 end
 
 local WEB_HTML = [=[<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Holo Clock 表盘</title><style>
@@ -1307,12 +1611,7 @@ const faces=['Meridian','Pulse WX','Neon Girl','Solar Weather','Terminal','Lunar
 </script></body></html>]=]
 
 local function encode_json(value)
-  local codec = rawget(_G, "json") or rawget(_G, "sjson")
-  if codec and codec.encode then
-    local ok, body = pcall_fn(codec.encode, value)
-    if ok and type(body) == "string" then return body end
-  end
-  return "{\"ok\":false,\"error\":\"JSON unavailable\"}"
+  return encode_json_value(value) or "{\"ok\":false,\"error\":\"JSON unavailable\"}"
 end
 
 local function web_response(body, content_type, status)
@@ -1389,6 +1688,22 @@ local function start_web()
     end
     return web_response(encode_json({ ok = true, default_face = APP.state.default_face, auto_switch_ms = APP.state.auto_switch_ms }), "application/json; charset=utf-8")
   end
+  local function weather_api()
+    return web_response(encode_json({
+      ok = true,
+      valid = APP.state.weather_valid,
+      source = APP.state.weather_source,
+      temperature = APP.state.temp,
+      humidity = APP.state.humidity,
+      wind_speed = APP.state.wind_speed,
+      weather_code = APP.state.weather_code,
+      weather_text = APP.state.weather_text,
+      forecast_valid = APP.state.forecast_valid,
+      forecast_days = #(APP.state.forecast_days or {}),
+      inflight = APP.state.weather_inflight or APP.state.forecast_inflight or APP.state.open_meteo_inflight,
+      last_error = APP.state.weather_last_error,
+    }), "application/json; charset=utf-8")
+  end
   local function snapshot_api(req)
     local raw = req and (req.body or req.payload) or nil
     if not raw and req and req.getbody then
@@ -1443,6 +1758,7 @@ local function start_web()
     route(server.POST, base .. "/api/face", face_api)
     route(server.GET, base .. "/api/settings", settings_api)
     route(server.POST, base .. "/api/settings", settings_api)
+    route(server.GET, base .. "/api/weather", weather_api)
     route(server.POST, base .. "/api/snapshot", snapshot_api)
   end
   APP.web_started = true
@@ -1573,6 +1889,7 @@ end
 APP.shutdown = APP.stop
 
 load_settings()
+load_weather_cache()
 load_app_config()
 init_time()
 init_fonts()

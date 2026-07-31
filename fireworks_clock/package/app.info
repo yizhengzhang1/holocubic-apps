@@ -1,0 +1,13 @@
+name = Fireworks Clock
+name_zh_cn = 烟花时钟
+name_zh_tw = 煙花時鐘
+name_ja = 花火時計
+name_en = Fireworks Clock
+entry = main.lua
+icon = main.png
+description = 烟花时钟：NTP 数字时钟 + 十种渐变尾迹烟花秀，含金色瀑布、锦冠、彗星长尾与旋转升空
+description_zh_cn = 烟花时钟：NTP 数字时钟与十种渐变尾迹烟花秀，含金色瀑布、锦冠、彗星长尾与旋转升空
+description_zh_tw = 煙花時鐘：NTP 數字時鐘與十種漸變尾跡煙花秀，包含金色瀑布、錦冠、彗星長尾與回轉升空
+description_ja = 花火時計：NTP デジタル時計と10種類のグラデーション花火、黄金の滝・ブロケードクラウン・彗星・回転上昇を収録
+description_en = Fireworks clock: NTP digital clock with ten tapered-trail effects, including golden waterfall, brocade crown, comet and spinner
+version = 0.12.0
